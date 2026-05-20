@@ -150,6 +150,13 @@ class H4BacktestEngine:
         lot_size: float = 0.02,
         window_size: int = 100,
         adx_min: float = 0.0,
+        # Filters matching BacktestEngine LIVE_PARITY parity
+        choppy_gate: bool = True,
+        choppy_adx_threshold: float = 20.0,
+        atr_pctl_floor: float = 0.30,
+        atr_pctl_window: int = 50,
+        rule_b_sigma: float = 2.5,
+        rule_b_lookback: int = 60,
         # Entry slippage model calibrated from 91 real EA trades
         slippage_model: str = "none",       # "none" | "fixed" | "empirical" | "realistic"
         slippage_buy: float = 0.67,
@@ -169,6 +176,13 @@ class H4BacktestEngine:
         self._lot_size = lot_size
         self._window = window_size
         self._adx_min = adx_min
+        # Filters
+        self._choppy_gate = choppy_gate
+        self._choppy_adx_threshold = choppy_adx_threshold
+        self._atr_pctl_floor = atr_pctl_floor
+        self._atr_pctl_window = atr_pctl_window
+        self._rule_b_sigma = rule_b_sigma
+        self._rule_b_lookback = rule_b_lookback
 
         # Entry slippage
         self._slippage_model = slippage_model
@@ -202,6 +216,9 @@ class H4BacktestEngine:
         self.filtered_cooldown = 0
         self.filtered_adx = 0
         self.filtered_max_pos = 0
+        self.filtered_choppy = 0
+        self.filtered_atr_pctl = 0
+        self.filtered_rule_b = 0
 
     def _calc_entry_slippage(self, direction: str) -> float:
         """Entry slippage from 91 real EA trades. Positive = worse for trader."""
@@ -219,6 +236,33 @@ class H4BacktestEngine:
             return self._slippage_buy if direction == 'BUY' else self._slippage_sell
         return 0.0
 
+    def _compute_atr_pctl(self, atr: np.ndarray) -> np.ndarray:
+        """Rolling percentile rank of ATR over window."""
+        n = len(atr)
+        out = np.full(n, 0.5)
+        w = self._atr_pctl_window
+        for i in range(w, n):
+            window = atr[i - w:i]
+            valid = window[~np.isnan(window)]
+            if len(valid) >= 10:
+                out[i] = float(np.sum(valid < atr[i])) / len(valid)
+        return out
+
+    def _check_rule_b(self, atr: np.ndarray, i: int) -> bool:
+        """Return True if Rule B blocks entry (ATR spike > mean + sigma*std)."""
+        lb = self._rule_b_lookback
+        if i < lb:
+            return False
+        window = atr[max(0, i - lb):i]
+        valid = window[~np.isnan(window)]
+        if len(valid) < 10:
+            return False
+        mean = float(valid.mean())
+        std = float(valid.std())
+        if std > 0 and atr[i] > mean + self._rule_b_sigma * std:
+            return True
+        return False
+
     def run(self) -> List[TradeRecord]:
         """Run backtest over all H4 bars. Returns list of TradeRecord."""
         h4 = self.h4_df
@@ -229,6 +273,9 @@ class H4BacktestEngine:
         atr = h4['ATR'].values
         times = h4.index
         adx = h4['ADX'].values if 'ADX' in h4.columns else np.zeros(n_bars)
+
+        # Pre-compute ATR percentile array for filter
+        atr_pctl = self._compute_atr_pctl(atr) if self._atr_pctl_floor > 0 else np.ones(n_bars)
 
         progress_step = max(1, n_bars // 10)
         print(f'  Backtest: {times[self._window]} -> {times[-1]}')
@@ -345,6 +392,21 @@ class H4BacktestEngine:
                 # ADX filter
                 if self._adx_min > 0 and adx[i] < self._adx_min:
                     self.filtered_adx += 1
+                    continue
+
+                # Choppy Gate: low ADX = choppy market
+                if self._choppy_gate and adx[i] < self._choppy_adx_threshold:
+                    self.filtered_choppy += 1
+                    continue
+
+                # ATR Percentile Floor
+                if self._atr_pctl_floor > 0 and atr_pctl[i] < self._atr_pctl_floor:
+                    self.filtered_atr_pctl += 1
+                    continue
+
+                # Rule B: extreme volatility spike
+                if self._rule_b_sigma > 0 and self._check_rule_b(atr, i):
+                    self.filtered_rule_b += 1
                     continue
 
                 # Determine SL/TP

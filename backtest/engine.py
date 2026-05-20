@@ -287,6 +287,17 @@ class BacktestEngine:
         # Gives ~1.6x speedup by avoiding H1 window lookup + M15 window slicing.
         # Trade-off: M15-only signals (RSI) on non-H1 bars are not checked when flat.
         skip_non_h1_bars: bool = True,
+        # M30 strategy integration (R236)
+        m30_df: Optional[pd.DataFrame] = None,
+        m30_enabled: bool = False,
+        m30_signal_func: Optional[Callable] = None,
+        m30_strategy_name: str = "m30_rsi14",
+        m30_sl_atr_mult: float = 8.0,
+        m30_tp_atr_mult: float = 8.0,
+        m30_trail_activate_atr: float = 0.50,
+        m30_trail_distance_atr: float = 0.15,
+        m30_max_hold_m15: int = 96,  # 48 M30 bars = 96 M15 bars
+        m30_cooldown_bars: int = 8,  # M30 bars cooldown (= 16 M15 bars)
         # Label
         label: str = "",
     ):
@@ -573,6 +584,29 @@ class BacktestEngine:
         self.skipped_adx_gray = 0
         self.escalated_cooldowns = 0
 
+        # M30 strategy (R236 integration)
+        self._m30_enabled = m30_enabled
+        self._m30_df = m30_df
+        self._m30_signal_func = m30_signal_func
+        self._m30_strategy_name = m30_strategy_name
+        self._m30_sl_atr_mult = m30_sl_atr_mult
+        self._m30_tp_atr_mult = m30_tp_atr_mult
+        self._m30_trail_act = m30_trail_activate_atr
+        self._m30_trail_dist = m30_trail_distance_atr
+        self._m30_max_hold_m15 = m30_max_hold_m15
+        self._m30_cooldown_m15 = m30_cooldown_bars * 2
+        self._m30_last_entry_bar = -9999
+        self.m30_total_signals = 0
+        self.m30_entries = 0
+        self.m30_skipped_choppy = 0
+        self.m30_skipped_atr = 0
+        self.m30_skipped_slot = 0
+        self.m30_skipped_cooldown = 0
+        if m30_enabled and m30_df is not None:
+            self._m30_lookup = self._build_m30_lookup(m30_df)
+        else:
+            self._m30_lookup = {}
+
         # ── P1: H1 column pre-extraction ──────────────────────────
         # Profile showed 52,723 calls to fast_xs (h1_window.iloc[-1])
         # accounting for ~3.94s self time. Pre-extracting columns as
@@ -857,8 +891,10 @@ class BacktestEngine:
             has_pending = len(self._pending_signals) > 0
             is_h1_boundary = (m15_minute_arr[i] == 0)
 
+            is_m30_boundary = self._m30_enabled and m15_minute_arr[i] in (15, 45)
             if (self._skip_non_h1_bars
-                    and not has_positions and not has_pending and not is_h1_boundary):
+                    and not has_positions and not has_pending
+                    and not is_h1_boundary and not is_m30_boundary):
                 self.equity_curve.append(base_capital + self._realized_pnl)
                 self.skipped_no_signal += 1
                 continue
@@ -895,6 +931,11 @@ class BacktestEngine:
 
                 if len(m15_window) >= 105:
                     self._check_m15_entries(m15_window, h1_window_closed, bar_time, h1_idx=h1_idx_closed)
+
+                # M30 signal check on M30 boundaries (when M15 minute is 15 or 45,
+                # the previous M30 bar just closed at :00 or :30)
+                if self._m30_enabled and m15_minute_arr[i] in (15, 45):
+                    self._check_m30_entries(bar_time, i, h1_idx=h1_idx_closed)
 
             unrealized = self._calc_unrealized(m15_close_arr[i])
             self.equity_curve.append(base_capital + self._realized_pnl + unrealized)
@@ -1092,6 +1133,37 @@ class BacktestEngine:
                         exit_price = close
                         self.profit_dd_exit_count += 1
 
+            # 2b. M30 trailing stop
+            if not reason and pos.strategy == self._m30_strategy_name and self._m30_enabled:
+                act_atr = self._m30_trail_act
+                dist_atr = self._m30_trail_dist
+                atr = self._get_h1_atr_at(h1_idx)
+                if atr > 0 and act_atr > 0 and dist_atr > 0:
+                    if pos.direction == 'BUY':
+                        float_profit = high - pos.entry_price
+                        pos.extreme_price = max(pos.extreme_price, high)
+                    else:
+                        float_profit = pos.entry_price - low
+                        pos.extreme_price = min(pos.extreme_price, low) if pos.extreme_price > 0 else low
+
+                    if float_profit >= atr * act_atr:
+                        trail_distance = atr * dist_atr
+                        if pos.direction == 'BUY':
+                            new_trail = pos.extreme_price - trail_distance
+                            pos.trailing_stop_price = max(pos.trailing_stop_price, new_trail)
+                            if low <= pos.trailing_stop_price:
+                                reason = "Trailing"
+                                exit_price = pos.trailing_stop_price
+                        else:
+                            new_trail = pos.extreme_price + trail_distance
+                            if pos.trailing_stop_price <= 0:
+                                pos.trailing_stop_price = new_trail
+                            else:
+                                pos.trailing_stop_price = min(pos.trailing_stop_price, new_trail)
+                            if high >= pos.trailing_stop_price:
+                                reason = "Trailing"
+                                exit_price = pos.trailing_stop_price
+
             # 4. Time stop
             if not reason:
                 if pos.strategy == 'm15_rsi':
@@ -1100,6 +1172,8 @@ class BacktestEngine:
                     max_hold = self._orb_max_hold_m15
                 elif pos.strategy == 'keltner' and self._keltner_max_hold_m15 > 0:
                     max_hold = self._keltner_max_hold_m15
+                elif pos.strategy == self._m30_strategy_name and self._m30_enabled:
+                    max_hold = self._m30_max_hold_m15
                 else:
                     max_hold_h1 = config.STRATEGIES.get(pos.strategy, {}).get('max_hold_bars', 15)
                     max_hold = max_hold_h1 * 4
@@ -1745,6 +1819,85 @@ class BacktestEngine:
         if filtered:
             self._pending_signals.append((filtered, 'M15'))
 
+    # ── M30 Entries (R236 integration) ─────────────────────────
+
+    def _check_m30_entries(self, bar_time, m15_bar_idx: int, *,
+                           h1_idx: Optional[int] = None):
+        """Check M30 strategy signals. Called on M30 boundaries (minute==0 or 30)."""
+        if not self._m30_enabled or self._m30_df is None or self._m30_signal_func is None:
+            return
+        if len(self.positions) >= self._max_pos:
+            self.m30_skipped_slot += 1
+            return
+
+        # Cooldown check
+        if (m15_bar_idx - self._m30_last_entry_bar) < self._m30_cooldown_m15:
+            self.m30_skipped_cooldown += 1
+            return
+
+        # Choppy Gate: block M30 entries in choppy regime
+        if self._intraday_adaptive and self._current_regime == 'choppy':
+            self.m30_skipped_choppy += 1
+            return
+
+        # ATR Percentile Floor: skip in low-vol
+        if h1_idx is not None and h1_idx >= 0:
+            atr_pct = self._get_atr_percentile_at(h1_idx)
+            if atr_pct < 0.30:
+                self.m30_skipped_atr += 1
+                return
+
+        # Find M30 bar for this time
+        m30_time = bar_time.floor('30min')
+        if m30_time not in self._m30_lookup:
+            return
+        m30_idx = self._m30_lookup[m30_time]
+
+        # Need lookback window for signal function
+        m30_window_start = max(0, m30_idx - 60)
+        m30_window = self._m30_df.iloc[m30_window_start:m30_idx + 1]
+        if len(m30_window) < 55:
+            return
+
+        sig = self._m30_signal_func(m30_window)
+        if sig is None:
+            return
+
+        self.m30_total_signals += 1
+        direction = sig.get('signal', '')
+        if direction not in ('BUY', 'SELL'):
+            return
+
+        # Rule B check: ATR > 2.5σ → skip
+        if h1_idx is not None and h1_idx >= 0:
+            cur_atr = self._h1_atr_arr[h1_idx]
+            if h1_idx >= 60:
+                atr_slice = self._h1_atr_arr[max(0, h1_idx - 60):h1_idx]
+                atr_mean = float(atr_slice.mean())
+                atr_std = float(atr_slice.std())
+                if atr_std > 0 and cur_atr > atr_mean + 2.5 * atr_std:
+                    self.m30_skipped_atr += 1
+                    return
+
+        # Get M30 ATR for SL/TP calculation
+        m30_atr = float(m30_window.iloc[-1].get('ATR', 0))
+        if m30_atr <= 0:
+            return
+
+        sl_dist = m30_atr * self._m30_sl_atr_mult
+        tp_dist = m30_atr * self._m30_tp_atr_mult
+
+        signal_dict = {
+            'signal': direction,
+            'strategy': self._m30_strategy_name,
+            'sl': sl_dist,
+            'tp': tp_dist,
+            '_m30_entry': True,
+        }
+
+        self._pending_signals.append(([signal_dict], 'M30'))
+        self._m30_last_entry_bar = m15_bar_idx
+
     def _check_m15_custom_rsi(self, m15_window, h1_window, bar_time, *,
                               h1_idx: Optional[int] = None):
         """Custom RSI threshold logic (replaces ParamExploreEngine)."""
@@ -1826,12 +1979,14 @@ class BacktestEngine:
             sl = sig.get('sl', config.STOP_LOSS_PIPS)
             tp = sig.get('tp', 0)
 
-            # SL/TP ATR overrides
-            if self._sl_atr_mult > 0 and bar_h1_atr > 0:
-                sl = round(bar_h1_atr * self._sl_atr_mult, 2)
-                sl = max(signals_mod.ATR_SL_MIN, min(signals_mod.ATR_SL_MAX, sl))
-            if self._tp_atr_mult > 0 and bar_h1_atr > 0:
-                tp = round(bar_h1_atr * self._tp_atr_mult, 2)
+            # SL/TP ATR overrides (skip for M30 signals which bring their own)
+            is_m30_signal = sig.get('_m30_entry', False)
+            if not is_m30_signal:
+                if self._sl_atr_mult > 0 and bar_h1_atr > 0:
+                    sl = round(bar_h1_atr * self._sl_atr_mult, 2)
+                    sl = max(signals_mod.ATR_SL_MIN, min(signals_mod.ATR_SL_MAX, sl))
+                if self._tp_atr_mult > 0 and bar_h1_atr > 0:
+                    tp = round(bar_h1_atr * self._tp_atr_mult, 2)
 
             if tp <= 0:
                 tp = sl * 2
@@ -1930,6 +2085,8 @@ class BacktestEngine:
 
             if source == 'H1':
                 self.h1_entry_count += 1
+            elif source == 'M30':
+                self.m30_entries += 1
             else:
                 self.m15_entry_count += 1
 
@@ -2189,6 +2346,10 @@ class BacktestEngine:
     @staticmethod
     def _build_h1_lookup(h1_df: pd.DataFrame) -> Dict[pd.Timestamp, int]:
         return {ts: i for i, ts in enumerate(h1_df.index)}
+
+    @staticmethod
+    def _build_m30_lookup(m30_df: pd.DataFrame) -> Dict[pd.Timestamp, int]:
+        return {ts: i for i, ts in enumerate(m30_df.index)}
 
     def _resolve_h1_idx(self, m15_time: pd.Timestamp) -> Optional[int]:
         """Resolve the H1 bar index aligned to m15_time."""

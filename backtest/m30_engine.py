@@ -212,6 +212,7 @@ class M30BacktestEngine:
         self.positions: List[Position] = []
         self.trades: List[TradeRecord] = []
         self._cooldown_until = 0
+        self._pending_entry: Optional[Dict] = None  # pending signal for next-bar-open execution
 
         self.total_signals = 0
         self.filtered_cooldown = 0
@@ -237,6 +238,7 @@ class M30BacktestEngine:
     def run(self) -> List[TradeRecord]:
         m30 = self.m30_df
         n_bars = len(m30)
+        open_prices = m30['Open'].values
         high = m30['High'].values
         low = m30['Low'].values
         close = m30['Close'].values
@@ -256,18 +258,22 @@ class M30BacktestEngine:
                 print(f'    {pct}%...', end='', flush=True)
 
             bar_time = times[i]
+            bar_open = open_prices[i]
             h, l, c = high[i], low[i], close[i]
             cur_atr = atr[i]
 
             if cur_atr <= 0 or np.isnan(cur_atr):
+                self._pending_entry = None
                 continue
 
             # Weekend check (Friday 21:00+ UTC, no new entries)
+            is_weekend = False
             if self._skip_weekend and has_hour:
                 dow = bar_time.dayofweek if hasattr(bar_time, 'dayofweek') else bar_time.weekday()
                 hr = bar_time.hour
                 if dow == 4 and hr >= 21:
-                    # Close any open positions at weekend
+                    is_weekend = True
+                    self._pending_entry = None
                     for pi, pos in enumerate(self.positions):
                         if pos.direction == 'BUY':
                             pnl = (c - pos.entry_price) * self._lot_size * 100 - self._spread
@@ -283,12 +289,46 @@ class M30BacktestEngine:
                     self.positions.clear()
                     continue
 
+            # ── Execute pending entry at this bar's Open ──
+            if self._pending_entry is not None and not is_weekend:
+                pe = self._pending_entry
+                self._pending_entry = None
+
+                if len(self.positions) < self._max_positions and i >= self._cooldown_until:
+                    entry_price = bar_open
+                    direction = pe['direction']
+
+                    slip = self._calc_entry_slippage(direction)
+                    if slip != 0.0:
+                        if direction == 'BUY':
+                            entry_price += slip
+                        else:
+                            entry_price -= slip
+                        self.total_entry_slippage += abs(slip)
+                        self.slippage_count += 1
+
+                    pos = Position(
+                        strategy=pe['strategy'],
+                        direction=direction,
+                        entry_price=entry_price,
+                        entry_time=bar_time,
+                        lots=self._lot_size,
+                        sl_distance=pe['sl_dist'],
+                        tp_distance=pe['tp_dist'],
+                        entry_atr=pe['entry_atr'],
+                    )
+                    self.positions.append(pos)
+
             # ── Manage open positions ──
             closed_indices = []
             for pi, pos in enumerate(self.positions):
                 pos.bars_held += 1
                 exit_price = None
                 reason = ""
+
+                # Skip trailing stop on entry bar (bars_held==1) to prevent
+                # same-bar intrabar look-ahead. SL/TP still apply for protection.
+                is_entry_bar = (pos.bars_held == 1)
 
                 if pos.direction == 'BUY':
                     if l <= pos.sl_price:
@@ -297,7 +337,7 @@ class M30BacktestEngine:
                     elif pos.tp_price > 0 and h >= pos.tp_price:
                         exit_price = pos.tp_price
                         reason = "TP"
-                    else:
+                    elif not is_entry_bar:
                         pos.extreme_price = max(pos.extreme_price, h)
                         if self._trail_act > 0 and self._trail_dist > 0:
                             profit = pos.extreme_price - pos.entry_price
@@ -318,7 +358,7 @@ class M30BacktestEngine:
                     elif pos.tp_price > 0 and l <= pos.tp_price:
                         exit_price = pos.tp_price
                         reason = "TP"
-                    else:
+                    elif not is_entry_bar:
                         pos.extreme_price = min(pos.extreme_price, l)
                         if self._trail_act > 0 and self._trail_dist > 0:
                             profit = pos.entry_price - pos.extreme_price
@@ -351,17 +391,17 @@ class M30BacktestEngine:
             for pi in reversed(closed_indices):
                 self.positions.pop(pi)
 
-            # ── Check for new entries ──
+            # ── Generate signals (execute on NEXT bar's Open) ──
             if i < self._cooldown_until:
                 continue
             if len(self.positions) >= self._max_positions:
+                continue
+            if self._pending_entry is not None:
                 continue
 
             window = m30.iloc[max(0, i - self._window + 1):i + 1]
 
             for strat_name, sig_func in self.signal_funcs:
-                if len(self.positions) >= self._max_positions:
-                    break
                 sig = sig_func(window)
                 if sig is None:
                     continue
@@ -384,29 +424,14 @@ class M30BacktestEngine:
                 else:
                     tp_dist = sig.get('tp', 0)
 
-                entry_price = c
-
-                # Apply realistic entry slippage
-                slip = self._calc_entry_slippage(direction)
-                if slip != 0.0:
-                    if direction == 'BUY':
-                        entry_price += slip
-                    else:
-                        entry_price -= slip
-                    self.total_entry_slippage += abs(slip)
-                    self.slippage_count += 1
-
-                pos = Position(
-                    strategy=sig.get('strategy', strat_name),
-                    direction=direction,
-                    entry_price=entry_price,
-                    entry_time=bar_time,
-                    lots=self._lot_size,
-                    sl_distance=sl_dist,
-                    tp_distance=tp_dist,
-                    entry_atr=cur_atr,
-                )
-                self.positions.append(pos)
+                self._pending_entry = {
+                    'strategy': sig.get('strategy', strat_name),
+                    'direction': direction,
+                    'sl_dist': sl_dist,
+                    'tp_dist': tp_dist,
+                    'entry_atr': cur_atr,
+                }
+                break
 
         print(' done!')
 

@@ -33,3 +33,9 @@ package-lock.json
 
 # Junction to gold-quant-trading (2026-04-23, Windows mklink /J)
 _live/
+
+# Live trade logs / runtime state (sensitive: account, tickets)
+scripts/.gold_trade_log.json
+scripts/.vps_watchdog_state.json
+**/.gold_trade_log.json
+**/.vps_watchdog_state.json

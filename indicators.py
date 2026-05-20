@@ -950,8 +950,180 @@ def check_monday_gap_fill(df: pd.DataFrame) -> Optional[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
+# R209 Non-Keltner H1 Strategies
+# ═══════════════════════════════════════════════════════════════
+
+def check_psar_signal(df: pd.DataFrame) -> Optional[Dict]:
+    """PSAR flip signal: bullish/bearish crossover of PSAR vs Close."""
+    if len(df) < 30:
+        return None
+    high = df['High'].values
+    low = df['Low'].values
+    close = df['Close'].values
+    n = len(df)
+
+    # Compute PSAR inline (last 2 bars needed for flip detection)
+    psar = np.zeros(n)
+    bull = True
+    af_step, af_max = 0.02, 0.20
+    af = af_step
+    ep = high[0]
+    psar[0] = low[0]
+    for i in range(1, n):
+        psar[i] = psar[i - 1] + af * (ep - psar[i - 1])
+        if bull:
+            psar[i] = min(psar[i], low[i - 1], low[max(0, i - 2)])
+            if low[i] < psar[i]:
+                bull = False
+                psar[i] = ep
+                af = af_step
+                ep = low[i]
+            else:
+                if high[i] > ep:
+                    ep = high[i]
+                    af = min(af + af_step, af_max)
+        else:
+            psar[i] = max(psar[i], high[i - 1], high[max(0, i - 2)])
+            if high[i] > psar[i]:
+                bull = True
+                psar[i] = ep
+                af = af_step
+                ep = high[i]
+            else:
+                if low[i] < ep:
+                    ep = low[i]
+                    af = min(af + af_step, af_max)
+
+    c_now, c_prev = close[-1], close[-2]
+    p_now, p_prev = psar[-1], psar[-2]
+
+    if p_prev > c_prev and p_now < c_now:
+        return {'strategy': 'psar', 'signal': 'BUY',
+                'reason': f'PSAR BUY flip: PSAR {p_now:.1f} < Close {c_now:.1f}'}
+    elif p_prev < c_prev and p_now > c_now:
+        return {'strategy': 'psar', 'signal': 'SELL',
+                'reason': f'PSAR SELL flip: PSAR {p_now:.1f} > Close {c_now:.1f}'}
+    return None
+
+
+def check_sess_bo_signal(df: pd.DataFrame) -> Optional[Dict]:
+    """Session Breakout: UTC hour 12 breakout of prior 4 bars."""
+    if len(df) < 5:
+        return None
+    idx = df.index
+    if hasattr(idx[-1], 'hour'):
+        hour = idx[-1].hour
+    else:
+        return None
+    if hour != 12:
+        return None
+
+    c = float(df['Close'].iloc[-1])
+    rng = df.iloc[-5:-1]
+    hi = float(rng['High'].max())
+    lo = float(rng['Low'].min())
+
+    if c > hi:
+        return {'strategy': 'sess_bo', 'signal': 'BUY',
+                'reason': f'Session BO BUY: Close {c:.1f} > range high {hi:.1f}'}
+    elif c < lo:
+        return {'strategy': 'sess_bo', 'signal': 'SELL',
+                'reason': f'Session BO SELL: Close {c:.1f} < range low {lo:.1f}'}
+    return None
+
+
+def check_dual_thrust_signal(df: pd.DataFrame, k_up: float = 0.5, k_dn: float = 0.5) -> Optional[Dict]:
+    """Dual Thrust breakout: close vs daily open +/- k * DT_range."""
+    if len(df) < 3:
+        return None
+    prev = df.iloc[-2]
+    cur = df.iloc[-1]
+    c = float(prev['Close'])
+    h_prev = float(prev['High'])
+    l_prev = float(prev['Low'])
+    c_prev = float(prev['Close'])
+    dt_range = max(h_prev - c_prev, c_prev - l_prev)
+    if dt_range <= 0:
+        return None
+    daily_open = float(prev['Open'])
+    if c > daily_open + k_up * dt_range:
+        return {'strategy': 'dual_thrust', 'signal': 'BUY',
+                'reason': f'DualThrust BUY: {c:.1f} > open+k*range ({daily_open:.1f}+{k_up*dt_range:.1f})'}
+    elif c < daily_open - k_dn * dt_range:
+        return {'strategy': 'dual_thrust', 'signal': 'SELL',
+                'reason': f'DualThrust SELL: {c:.1f} < open-k*range ({daily_open:.1f}-{k_dn*dt_range:.1f})'}
+    return None
+
+
+def check_chandelier_signal(df: pd.DataFrame, period: int = 22, mult: float = 3.0) -> Optional[Dict]:
+    """Chandelier Exit breakout + RSI filter."""
+    if len(df) < period + 3:
+        return None
+    high = df['High'].values
+    low = df['Low'].values
+    close = df['Close'].values
+    n = len(df)
+
+    # ATR (simple)
+    tr = np.maximum(high[1:] - low[1:],
+                    np.maximum(np.abs(high[1:] - close[:-1]),
+                               np.abs(low[1:] - close[:-1])))
+    atr = np.zeros(n)
+    for i in range(14, n - 1):
+        atr[i + 1] = np.mean(tr[max(0, i - 13):i + 1])
+
+    # Chandelier levels for last 3 bars
+    def chand_at(idx):
+        if idx < period:
+            return np.nan, np.nan
+        hh = np.max(high[idx - period + 1:idx + 1])
+        ll = np.min(low[idx - period + 1:idx + 1])
+        a = atr[idx] if atr[idx] > 0 else 1.0
+        return hh - mult * a, ll + mult * a
+
+    cl_now, cs_now = chand_at(n - 1)
+    cl_prev, cs_prev = chand_at(n - 2)
+    cl_pprev, cs_pprev = chand_at(n - 3)
+
+    if np.isnan(cl_now) or np.isnan(cl_prev):
+        return None
+
+    c_prev = close[-2]
+    c_pprev = close[-3]
+
+    # RSI-14 for filter
+    delta = np.diff(close)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    if len(gain) >= 14:
+        avg_g = np.mean(gain[-14:])
+        avg_l = np.mean(loss[-14:])
+        rsi = 100 - 100 / (1 + avg_g / max(avg_l, 1e-9))
+    else:
+        rsi = 50.0
+
+    # Chandelier breakout with RSI filter
+    if c_prev > cl_prev and c_pprev <= cl_pprev:
+        if rsi < 70:
+            return {'strategy': 'chandelier', 'signal': 'BUY',
+                    'reason': f'Chandelier BUY: break above {cl_prev:.1f}, RSI={rsi:.1f}'}
+    elif c_prev < cs_prev and c_pprev >= cs_pprev:
+        if rsi > 30:
+            return {'strategy': 'chandelier', 'signal': 'SELL',
+                    'reason': f'Chandelier SELL: break below {cs_prev:.1f}, RSI={rsi:.1f}'}
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
 # 信号扫描入口
 # ═══════════════════════════════════════════════════════════════
+
+# Control flags for non-Keltner strategies (disabled by default for live)
+PSAR_ENABLED = False
+SESS_BO_ENABLED = False
+DUAL_THRUST_ENABLED = False
+CHANDELIER_ENABLED = False
+
 
 def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1',
                      h1_adx: float = None) -> List[Dict]:
@@ -975,6 +1147,23 @@ def scan_all_signals(df: pd.DataFrame, timeframe: str = 'H1',
         sig = check_monday_gap_fill(df)
         if sig:
             signals.append(sig)
+        # R209 non-Keltner strategies (validation mode)
+        if PSAR_ENABLED:
+            sig = check_psar_signal(df)
+            if sig:
+                signals.append(sig)
+        if SESS_BO_ENABLED:
+            sig = check_sess_bo_signal(df)
+            if sig:
+                signals.append(sig)
+        if DUAL_THRUST_ENABLED:
+            sig = check_dual_thrust_signal(df)
+            if sig:
+                signals.append(sig)
+        if CHANDELIER_ENABLED:
+            sig = check_chandelier_signal(df)
+            if sig:
+                signals.append(sig)
     elif timeframe in ('M5', 'M15'):
         sig = check_m15_rsi_signal(df, h1_adx=h1_adx)
         if sig:
