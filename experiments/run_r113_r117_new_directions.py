@@ -99,11 +99,13 @@ def kfold_test(run_func, data, folds, **kwargs):
 # ═══════════════════════════════════════════════════════════════
 
 def load_gold_daily():
-    df = pd.read_csv(DATA_DIR / "xauusd_daily_yf.csv", index_col=0, parse_dates=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
+    # Use spot XAUUSD D1 (HistData M15 resampled) — same instrument as the live
+    # broker. Previous version loaded xauusd_daily_yf.csv (= COMEX GC=F futures),
+    # which is offset 5-10 USD from spot.
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from backtest.runner import load_d1_spot
+    df = load_d1_spot(tz_naive=True)
     df = df.dropna(subset=['Close'])
     tr = pd.concat([df['High'] - df['Low'],
                      (df['High'] - df['Close'].shift()).abs(),

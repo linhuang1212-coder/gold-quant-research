@@ -92,12 +92,14 @@ def main():
     print("  R113-B: COT Signal with REAL CFTC Data")
     print("=" * 80)
 
-    # Load data
-    gold = pd.read_csv(DATA_DIR / "xauusd_daily_yf.csv", index_col=0, parse_dates=True)
-    if isinstance(gold.columns, pd.MultiIndex):
-        gold.columns = gold.columns.get_level_values(0)
-    if gold.index.tz is not None:
-        gold.index = gold.index.tz_localize(None)
+    # Load data — use spot XAUUSD D1 (M15 resampled) so that the trades simulated
+    # in this experiment match the broker price we actually execute against.
+    # Previously used xauusd_daily_yf.csv (= COMEX GC=F futures), which sits
+    # 5-10 USD off spot and biases SL/TP/ATR-based PnL calculations.
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from backtest.runner import load_d1_spot
+    gold = load_d1_spot(tz_naive=True)
     gold = gold.dropna(subset=['Close'])
 
     tr = pd.concat([gold['High'] - gold['Low'],

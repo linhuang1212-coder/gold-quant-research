@@ -65,9 +65,24 @@ def metrics(pnl_arr):
 
 
 def load_data():
-    gold = pd.read_csv(DATA_DIR / "xauusd_daily_yf.csv", index_col=0, parse_dates=True)
-    if isinstance(gold.columns, pd.MultiIndex):
-        gold.columns = gold.columns.get_level_values(0)
+    # NOTE: The "overnight premium" effect this experiment studies is structurally
+    # tied to RTH session boundaries (Close = NY pit close, Open = next-session open).
+    # We therefore use GC=F futures D1 here intentionally — spot XAUUSD has no
+    # natural overnight gap because forex trades 24h. If the futures CSV is
+    # missing, fall back to spot D1 resampled with a 21:00 UTC anchor (NY close),
+    # which is the closest spot-data approximation.
+    yf_path = DATA_DIR / "xauusd_daily_yf.csv"
+    if yf_path.exists():
+        gold = pd.read_csv(yf_path, index_col=0, parse_dates=True)
+        if isinstance(gold.columns, pd.MultiIndex):
+            gold.columns = gold.columns.get_level_values(0)
+    else:
+        print(f"  [WARN] {yf_path.name} not found; falling back to spot D1 "
+              f"(M15 resampled @ 21:00 UTC NY-close anchor)")
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from backtest.runner import load_d1_spot
+        gold = load_d1_spot(session_close_utc=21, tz_naive=True)
     if gold.index.tz is not None:
         gold.index = gold.index.tz_localize(None)
     gold = gold.dropna(subset=['Close'])

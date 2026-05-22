@@ -1655,35 +1655,30 @@ if not phase_done("B3_mtf_fusion"):
     b3_results = {}
 
     # D1 + H1 alignment for Keltner
-    print("\n  --- Keltner: D1 EMA Alignment Filter ---")
-    d1_path = Path("data/xauusd_daily_yf.csv")
-    if d1_path.exists():
-        d1 = pd.read_csv(d1_path)
-        if 'Date' in d1.columns:
-            d1['Date'] = pd.to_datetime(d1['Date'])
-            d1.set_index('Date', inplace=True)
-        elif 'timestamp' in d1.columns:
-            d1['timestamp'] = pd.to_datetime(d1['timestamp'], unit='ms', utc=True)
-            d1.set_index('timestamp', inplace=True)
+    # Use spot XAUUSD D1 (resampled from HistData M15 bid) to keep the D1 EMA
+    # filter on the same instrument as the M15/H1 entry signals. Previously
+    # this loaded xauusd_daily_yf.csv (= COMEX GC=F futures), which is offset
+    # 5-10 USD from spot and uses RTH session boundaries — a silent bias.
+    print("\n  --- Keltner: D1 EMA Alignment Filter (spot XAUUSD) ---")
+    try:
+        from backtest.runner import load_d1_spot
+        d1 = load_d1_spot()
+        d1_close = d1['Close']
+        d1_ema20 = d1_close.ewm(span=20).mean()
+        b3_results['d1_data'] = f"{len(d1)} rows (spot)"
+        print(f"    D1 spot data loaded: {len(d1)} rows")
 
-        close_col = [c for c in d1.columns if c.lower() in ('close', 'adj close')]
-        if close_col:
-            d1_close = d1[close_col[0]]
-            d1_ema20 = d1_close.ewm(span=20).mean()
-            b3_results['d1_data'] = f"{len(d1)} rows"
-            print(f"    D1 data loaded: {len(d1)} rows")
-
-            # Test with EMA slope filter on engine
-            for slope_bars in [5, 10, 20]:
-                label = f"ema_slope_{slope_bars}"
-                era = run_all_eras_engine(data, label, block_buy_ema_slope=slope_bars)
-                b3_results[label] = era
-                full = era.get('Full (2015-2026)', {}).get('sharpe', 0)
-                recent = era.get('Recent (2024-2026)', {}).get('sharpe', 0)
-                print(f"    EMA slope filter (bars={slope_bars}): Full={full:.3f} Recent={recent:.3f}")
-    else:
-        b3_results['d1_data'] = 'not_found'
-        print(f"    D1 data not found")
+        # Test with EMA slope filter on engine
+        for slope_bars in [5, 10, 20]:
+            label = f"ema_slope_{slope_bars}"
+            era = run_all_eras_engine(data, label, block_buy_ema_slope=slope_bars)
+            b3_results[label] = era
+            full = era.get('Full (2015-2026)', {}).get('sharpe', 0)
+            recent = era.get('Recent (2024-2026)', {}).get('sharpe', 0)
+            print(f"    EMA slope filter (bars={slope_bars}): Full={full:.3f} Recent={recent:.3f}")
+    except FileNotFoundError as e:
+        b3_results['d1_data'] = f'not_found: {e}'
+        print(f"    D1 spot data not available: {e}")
 
     # Cross-TF ATR regime: D1 ATR vs H1 ATR
     print("\n  --- Cross-TF ATR Regime ---")

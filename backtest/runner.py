@@ -100,6 +100,75 @@ def load_h1_aligned(h1_path: Path, m15_start: pd.Timestamp) -> pd.DataFrame:
     return df
 
 
+_D1_SPOT_CACHE: Dict[str, pd.DataFrame] = {}
+
+
+def load_d1_spot(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    *,
+    session_close_utc: int = 0,
+    m15_path: Optional[Path] = None,
+    tz_naive: bool = False,
+) -> pd.DataFrame:
+    """Spot XAUUSD D1 OHLCV by resampling HistData M15 bid bars.
+
+    Use this instead of ``data/xauusd_daily_yf.csv`` (which is COMEX GC=F futures)
+    for any D1-level trend / EMA-alignment / regime filter that interacts with
+    M15/H1 spot signals.  Eliminates the 5-10 USD futures-vs-spot basis that
+    silently biases D1 EMA20 / SMA200 filters.
+
+    Args:
+        start, end: ISO date strings (e.g. "2015-01-01"); inclusive.
+        session_close_utc: UTC hour anchoring the daily bar close.
+            * 0  = UTC midnight (default; natural for 24h forex)
+            * 21 = NY close (matches CME RTH boundary, useful for replicating
+                   futures-style "overnight" semantics on spot data)
+        m15_path: override M15 CSV (defaults to ``M15_CSV_PATH``).
+        tz_naive: if True, drop timezone from the result index (matches the
+            shape produced by ``pd.read_csv(parse_dates=True, index_col='Date')``
+            on the old ``xauusd_daily_yf.csv``).
+
+    Returns:
+        DataFrame with columns ``Open, High, Low, Close, Volume`` indexed by
+        the daily bar close timestamp (UTC unless ``tz_naive``).
+    """
+    path = m15_path or M15_CSV_PATH
+    if not path.exists():
+        raise FileNotFoundError(f"M15 CSV not found for D1 resample: {path}")
+
+    cache_key = f"{path}|{session_close_utc}"
+    if cache_key not in _D1_SPOT_CACHE:
+        m15 = load_csv(str(path))
+        if session_close_utc == 0:
+            d1 = m15.resample('1D', label='left', closed='left').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                'Volume': 'sum',
+            })
+        else:
+            offset = pd.Timedelta(hours=session_close_utc)
+            shifted = m15.copy()
+            shifted.index = shifted.index - offset
+            d1 = shifted.resample('1D', label='left', closed='left').agg({
+                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+                'Volume': 'sum',
+            })
+            d1.index = d1.index + offset
+        d1 = d1.dropna(subset=['Close'])
+        _D1_SPOT_CACHE[cache_key] = d1
+        print(f"  D1 spot (M15 resampled, session_close={session_close_utc:02d}:00 UTC): "
+              f"{len(d1)} bars, {d1.index[0].date()} -> {d1.index[-1].date()}")
+
+    df = _D1_SPOT_CACHE[cache_key].copy()
+    if start:
+        df = df[df.index >= pd.Timestamp(start, tz='UTC')]
+    if end:
+        df = df[df.index <= pd.Timestamp(end, tz='UTC')]
+    if tz_naive:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
 def check_data_gaps(df: pd.DataFrame, label: str, expected_freq: str):
     """Detect and report gaps in time series data.
 

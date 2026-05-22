@@ -478,21 +478,20 @@ def main():
     print("=" * 60, flush=True)
 
     from backtest.runner import load_csv
+    # H1 spot XAUUSD bid (HistData) only — do NOT silently fall back to
+    # data/xauusd_h1_yf.csv (= GC=F futures), the schema and price level differ.
     h1_candidates = [
+        Path("data/download/xauusd-h1-bid-2015-01-01-2026-05-06.csv"),
+        Path("data/download/xauusd-h1-bid-2015-01-01-2026-05-05.csv"),
         Path("data/download/xauusd-h1-bid-2015-01-01-2026-04-27.csv"),
         Path("data/download/xauusd-h1-bid-2015-01-01-2026-04-10.csv"),
         Path("data/download/xauusd-h1-bid-2015-01-01-2026-03-25.csv"),
-        Path("data/xauusd_h1_yf.csv"),
     ]
     h1_path = next((p for p in h1_candidates if p.exists()), None)
     if h1_path is None:
-        print(f"ERROR: No H1 data file found", flush=True)
+        print(f"ERROR: No HistData H1 bid CSV found in {h1_candidates[0].parent}", flush=True)
         return
-    if 'download' in str(h1_path):
-        h1_df = load_csv(str(h1_path))
-    else:
-        h1_df = pd.read_csv(h1_path, parse_dates=['Datetime'])
-        h1_df.set_index('Datetime', inplace=True)
+    h1_df = load_csv(str(h1_path))
     h1_df.sort_index(inplace=True)
     print(f"H1 data: {len(h1_df)} bars ({h1_df.index[0]} ~ {h1_df.index[-1]})", flush=True)
 
