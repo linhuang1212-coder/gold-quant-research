@@ -283,6 +283,10 @@ class BacktestEngine:
         maxloss_cap: float = 0,
         # R53B: Dynamic ATR Cap — maxloss = N * ATR * lots * POINT_VALUE (0 = use fixed cap)
         maxloss_cap_atr_mult: float = 0,
+        # R249: Per-strategy ATR cap override (dict by strategy name, overrides global)
+        # Example: {'tsmom': 1.0, 'sess_bo': 1.0, 'dual_thrust': 1.0}
+        # Strategies not in the dict use maxloss_cap_atr_mult (or maxloss_cap if mult=0).
+        maxloss_cap_atr_mult_by_strategy: dict | None = None,
         # Performance: when no positions and not H1 boundary, skip the bar entirely.
         # Gives ~1.6x speedup by avoiding H1 window lookup + M15 window slicing.
         # Trade-off: M15-only signals (RSI) on non-H1 bars are not checked when flat.
@@ -547,7 +551,9 @@ class BacktestEngine:
         self._equity_ma_period = equity_ma_period
         self._maxloss_cap = maxloss_cap
         self._maxloss_cap_atr_mult = maxloss_cap_atr_mult
+        self._maxloss_cap_atr_mult_by_strategy = maxloss_cap_atr_mult_by_strategy or {}
         self.maxloss_cap_count = 0
+        self.maxloss_cap_count_by_strategy: dict[str, int] = {}
         self._skip_non_h1_bars = skip_non_h1_bars
         self._consecutive_wins = 0
         self._consecutive_losses = 0
@@ -989,10 +995,12 @@ class BacktestEngine:
 
             # 1a. MaxLoss Cap — per-trade floating loss hard limit
             cap_limit = self._maxloss_cap
-            if self._maxloss_cap_atr_mult > 0:
+            strat_mult = self._maxloss_cap_atr_mult_by_strategy.get(pos.strategy)
+            effective_mult = strat_mult if strat_mult is not None else self._maxloss_cap_atr_mult
+            if effective_mult > 0:
                 atr_cap = self._get_h1_atr_at(h1_idx)
                 if atr_cap > 0:
-                    cap_limit = self._maxloss_cap_atr_mult * atr_cap * pos.lots * config.POINT_VALUE_PER_LOT
+                    cap_limit = effective_mult * atr_cap * pos.lots * config.POINT_VALUE_PER_LOT
             if not reason and cap_limit > 0:
                 if pos.direction == 'BUY':
                     float_pnl = (close - pos.entry_price) * pos.lots * config.POINT_VALUE_PER_LOT
@@ -1002,6 +1010,8 @@ class BacktestEngine:
                     reason = "MaxLossCap"
                     exit_price = close
                     self.maxloss_cap_count += 1
+                    self.maxloss_cap_count_by_strategy[pos.strategy] = \
+                        self.maxloss_cap_count_by_strategy.get(pos.strategy, 0) + 1
 
             # 1b. Breakeven stop: move SL to entry when profit exceeds threshold
             if not reason and self._breakeven_after_atr > 0 and pos.strategy == 'keltner':

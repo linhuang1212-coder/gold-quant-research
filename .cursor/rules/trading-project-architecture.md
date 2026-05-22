@@ -42,9 +42,9 @@ GoldBridge_EA.mq4 — MT4端，纯"下单执行器"
 | Strategy | Lots | MaxLoss Cap | SL/TP (ATR) | Trail Act/Dist | Max Hold | Notes |
 |----------|------|-------------|-------------|----------------|----------|-------|
 | Keltner (Trail-First) | 0.04 | None (SL兜底) | 3.5 / 8.0 | **0.06 / 0.015** | 2 H1 bars | R202 trail, R178 session ADX, ML filter (0.65) |
-| TSMOM | 0.04 | $60 (cap_atr=6.5) | 3.5 / 8.0 | 0.14 / 0.025 | 30 bars | Score 480/960, R205/R206 |
-| SESS_BO | 0.04 | $60 (cap_atr=5.0) | 4.5 / 4.0 | 0.06 / 0.01 | 20 bars | GMT12 breakout, D1 EMA20 filter ON |
-| Dual Thrust | 0.04 | $18 (cap_atr=5.0) | 6.0 / 8.0 | 0.06 / 0.01 | 20 bars | k=0.5, n_bars=6 |
+| TSMOM | 0.04 | $60 (cap_atr=**1.0**) | 3.5 / 8.0 | 0.14 / 0.025 | 30 bars | Score 480/960, R205/R206, **R249 cap_atr 6.5→1.0** (2026-05-22) |
+| SESS_BO | 0.04 | $60 (cap_atr=**1.0**) | 4.5 / 4.0 | 0.06 / 0.01 | 20 bars | GMT12 breakout, D1 EMA20 filter ON, **R249 cap_atr 5.0→1.0** (engine Sharpe 0.54→0.94) |
+| Dual Thrust | 0.04 | $18 (cap_atr=**1.0**) | 6.0 / 8.0 | 0.06 / 0.01 | 20 bars | k=0.5, n_bars=6, **R249 cap_atr 5.0→1.0** (量增33%, MaxDD-18%) |
 | M30 RSI14 | 0.04 | None | 8.0 / 8.0 | 0.30 / 0.08 | 24 bars | RSI14 mean-reversion on M30 |
 | PSAR | OFF | - | - | - | - | R209v2: 10年Sharpe=-0.37, 关闭 |
 | Chandelier | OFF | - | - | - | - | R209v2: 10年Sharpe=0.07, 关闭 |
