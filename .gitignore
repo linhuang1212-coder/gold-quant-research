@@ -39,3 +39,11 @@ scripts/.gold_trade_log.json
 scripts/.vps_watchdog_state.json
 **/.gold_trade_log.json
 **/.vps_watchdog_state.json
+
+# Local-only workspace state (snapshots, backups, weekly reviews)
+# Contain copies of live VPS config + system internals; not for git.
+_backups/
+_live_snapshot/
+_live_original/
+_week_review/
+_ic_history_snapshot/
