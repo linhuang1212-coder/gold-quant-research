@@ -808,6 +808,17 @@ LIVE_PARITY_KWARGS = {
     "maxloss_cap": 0,
     "max_positions": 1,
     "live_atr_percentile": True,
+    # R250 A1 Keltner H1 trend filter: kept as engine-side option but DEFAULT OFF
+    # Reason: R252-A neighborhood scan flagged EMA(9,21) as an isolated peak
+    # (邻域内 8/9 个相邻参数都明显变差), so deploying A1 to live is unsafe.
+    # Set to 'a1' / 'a2' / 'a1+a2' only for ablation/research.
+    "keltner_trend_filter_mode": "off",
+    "keltner_trend_filter_ema50_lookback": 5,
+    # R251 DT trail: validated by R252-A (OOS Sharpe +0.665, MaxDD -29%) and
+    # R252-B (PBO=0% LIVE / 8.6% REALISTIC, DSR=1.000). Default ON is safe.
+    "dual_thrust_trail_enabled": True,
+    "dual_thrust_trail_act": 0.10,
+    "dual_thrust_trail_dist": 0.01,
 }
 
 # Realistic execution cost preset — calibrated from 91 real EA trades (2026-04/05).

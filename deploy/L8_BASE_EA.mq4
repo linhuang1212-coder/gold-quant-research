@@ -3,15 +3,18 @@
 //| L8_BASE + Cap80                                                   |
 //| R41 K-Fold 6/6 PASS (CorrSh Mean=6.27, Min=1.14)                |
 //| R144: +Rule B extreme protection, Sharpe +0.38                   |
+//| R250 A1 (H1 EMA9>EMA21 过滤): code 已加, 但 R252 判定 isolated   |
+//|   peak / 轻度过拟合, **默认关闭**, 仅作 ablation 用。            |
 //| Chart: XAUUSD M15                                                |
 //+------------------------------------------------------------------+
 //| L8_BASE vs L7:                                                    |
 //|   ADX: 18 -> 14, Normal Trail: 0.14/0.025, High: 0.06/0.008    |
 //|   TATrail: OFF, MaxHold: 20                                       |
 //| Rule B: R144 validated, skip 8 H1 bars after 3-sigma ATR spike   |
+//| A1: R250 code 集成, R252 邻域扫描否决, 默认 false                |
 //+------------------------------------------------------------------+
 #property copyright "Gold Quant Research"
-#property version   "3.10"
+#property version   "3.21"
 #property strict
 
 //--- Trading params
@@ -47,6 +50,16 @@ extern bool   H1_Filter_Enabled = true;
 extern int    H1_KC_EMA_Period  = 15;
 extern double H1_KC_Multiplier  = 2.0;
 extern int    H1_ATR_Period     = 14;
+
+//--- R250 A1: H1 EMA Trend Filter — DEFAULT DISABLED per R252 verdict.
+//--- BUY 信号需 H1 EMA9 > EMA21 同向; SELL 信号需 H1 EMA9 < EMA21.
+//--- R250 single-config 11y Sharpe gain looked promising, BUT R252 邻域扫描
+//--- (EMA fast/slow ± 2 grid) 显示 (9,21) 是 isolated peak, 邻近 8/9 参数
+//--- 都变差, 且 OOS 16 月增益接近 0 — 判定轻度过拟合, 暂不投产。
+//--- 若要重新评估, 设 A1_TrendFilter_Enabled=true 单独跑 paper 至少 4 周。
+extern bool   A1_TrendFilter_Enabled = false;
+extern int    A1_EMA_Fast_Period     = 9;
+extern int    A1_EMA_Slow_Period     = 21;
 
 //--- EqCurve
 extern bool   EqCurve_Enabled   = true;
@@ -177,6 +190,32 @@ string GetH1KCDirection()
    if(h1_close > kc_upper) return "BULL";
    if(h1_close < kc_lower) return "BEAR";
    return "NEUTRAL";
+}
+
+//+------------------------------------------------------------------+
+//| R250 A1 趋势过滤: 检查 H1 EMA9 vs EMA21 是否同向                |
+//| 返回 true 表示通过, false 表示应拦截入场                         |
+//+------------------------------------------------------------------+
+bool PassesA1TrendFilter(int signal)
+{
+   if(!A1_TrendFilter_Enabled) return true;
+
+   double ema_fast = iMA(Symbol(), PERIOD_H1, A1_EMA_Fast_Period, 0,
+                         MODE_EMA, PRICE_CLOSE, 1);
+   double ema_slow = iMA(Symbol(), PERIOD_H1, A1_EMA_Slow_Period, 0,
+                         MODE_EMA, PRICE_CLOSE, 1);
+
+   if(signal == 1  && ema_fast <= ema_slow)
+   {
+      Print("A1 拦截 BUY: EMA9=", ema_fast, " <= EMA21=", ema_slow);
+      return false;
+   }
+   if(signal == -1 && ema_fast >= ema_slow)
+   {
+      Print("A1 拦截 SELL: EMA9=", ema_fast, " >= EMA21=", ema_slow);
+      return false;
+   }
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -477,6 +516,9 @@ void OnTick()
       if(signal == 1 && h1Dir != "BULL") return;
       if(signal == -1 && h1Dir != "BEAR") return;
    }
+
+   if(!PassesA1TrendFilter(signal))
+      return;
 
    if(!IsKCBandwidthExpanding())
       return;

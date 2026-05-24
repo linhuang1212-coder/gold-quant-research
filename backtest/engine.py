@@ -184,6 +184,17 @@ class BacktestEngine:
         time_adaptive_trail_floor: float = 0.005,  # minimum trail_dist floor
         # Breakeven stop: move SL to entry after float profit exceeds threshold
         breakeven_after_atr: float = 0.0,  # 0=disabled; e.g. 0.5 = move SL to entry when profit >= 0.5*ATR
+        # R250 BE/Profit Lock 扩展 (向后兼容: 默认为旧行为)
+        breakeven_buffer_atr: float = 0.0,  # SL 锚点 = entry +/- buffer_atr*ATR (0=精确保本, 0.3=锁 30% ATR 利润)
+        breakeven_tiers: list = None,        # 多档锁利: [(threshold_atr, buffer_atr), ...] 例 [(0.4, 0), (1.0, 0.3)], 自动按 threshold 排序, 取已触发最高档
+        breakeven_strategies: set = None,    # 启用 BE 的策略集合; None=只 keltner(兼容旧), {'all'}=全部, {'tsmom','dual_thrust'}=指定子集
+        # R250 Keltner H1 趋势过滤
+        keltner_trend_filter_mode: str = "off",  # off / A1 (EMA9>EMA21) / A2 (EMA50 slope) / A1+A2 (both)
+        keltner_trend_filter_ema50_lookback: int = 5,  # A2: 检查最近 N 根 H1 EMA50 是否单调
+        # R250 DualThrust trailing (engine baseline 中 dual_thrust 无 trailing, 此处增量加入)
+        dual_thrust_trail_enabled: bool = False,  # 默认 off 向后兼容
+        dual_thrust_trail_act: float = 0.06,  # 浮盈达到 act*ATR 激活 trailing
+        dual_thrust_trail_dist: float = 0.01,  # trailing 距离 = dist*ATR
         # Pinbar confirmation: require Pinbar on preceding H1 bar aligned with entry direction
         pinbar_confirmation: bool = False,
         # Support/Resistance proximity filter: skip BUY near resistance, skip SELL near support
@@ -438,9 +449,25 @@ class BacktestEngine:
         self._ta_trail_decay = time_adaptive_trail_decay
         self._ta_trail_floor = time_adaptive_trail_floor
 
-        # Breakeven stop
+        # Breakeven stop / Profit Lock-in (R250)
         self._breakeven_after_atr = breakeven_after_atr
+        self._breakeven_buffer_atr = breakeven_buffer_atr
+        self._breakeven_tiers = sorted(breakeven_tiers, key=lambda x: x[0]) if breakeven_tiers else None
+        self._breakeven_strategies = breakeven_strategies  # None / {'all'} / set of strategy names
         self.breakeven_triggered = 0
+        self.breakeven_triggered_by_strategy: dict = {}
+        self.breakeven_tier_triggered: dict = {}  # 各档触发计数
+
+        # R250 Keltner H1 趋势过滤
+        self._keltner_trend_filter_mode = (keltner_trend_filter_mode or "off").lower()
+        self._keltner_trend_filter_ema50_lookback = max(2, int(keltner_trend_filter_ema50_lookback))
+        self.keltner_trend_filtered_count = 0  # 被趋势过滤的 keltner 信号数
+
+        # R250 DualThrust trailing
+        self._dual_thrust_trail_enabled = bool(dual_thrust_trail_enabled)
+        self._dual_thrust_trail_act = float(dual_thrust_trail_act)
+        self._dual_thrust_trail_dist = float(dual_thrust_trail_dist)
+        self.dual_thrust_trail_triggered = 0  # dual_thrust trailing 触发次数
 
         # Pinbar / S/R filters
         self._pinbar_confirmation = pinbar_confirmation
@@ -638,6 +665,14 @@ class BacktestEngine:
         self._h1_kc_lower_arr = _arr('KC_lower', np.nan)
         self._h1_kc_mid_arr = _arr('KC_mid', np.nan)
         self._h1_close_arr = _arr('Close', np.nan)
+        # R250: Keltner H1 趋势过滤所需 (EMA9/21/50)
+        self._h1_ema9_arr = _arr('EMA9', np.nan)
+        self._h1_ema21_arr = _arr('EMA21', np.nan)
+        if 'EMA50' in h1_df.columns:
+            self._h1_ema50_arr = _arr('EMA50', np.nan)
+        else:
+            # 现场计算 EMA50 (h1_df 通常无此列)
+            self._h1_ema50_arr = h1_df['Close'].ewm(span=50, adjust=False).mean().to_numpy(dtype=np.float64)
 
         # Pre-compute live atr percentile (rolling-50 rank) so
         # _get_atr_percentile_at() with live_atr_percentile=True is O(1)
@@ -826,6 +861,59 @@ class BacktestEngine:
         val = self._h1_atr_arr[h1_idx]
         return 0.0 if np.isnan(val) else float(val)
 
+    def _check_keltner_h1_trend(self, h1_idx: Optional[int], direction: str) -> bool:
+        """R250 Track A: 检查 H1 趋势是否允许 Keltner 入场。
+
+        返回 True 表示允许 entry, False 表示过滤。
+
+        模式 (self._keltner_trend_filter_mode):
+          - 'off': 不过滤 (此函数不会被调用, 但兼容)
+          - 'a1': EMA9 vs EMA21 排列 (BUY 要求 EMA9>EMA21, SELL 反之)
+          - 'a2': EMA50 单调方向 (BUY 要求最近 N 根 EMA50 不连续下行, SELL 反之)
+          - 'a1+a2': 两条都满足
+        """
+        if h1_idx is None or h1_idx < 0 or h1_idx >= self._h1_n:
+            return True  # 数据异常时放行 (fail-open)
+        mode = self._keltner_trend_filter_mode
+        ema9 = float(self._h1_ema9_arr[h1_idx])
+        ema21 = float(self._h1_ema21_arr[h1_idx])
+
+        # A1: EMA9 vs EMA21 排列
+        a1_pass = True
+        if mode in ('a1', 'a1+a2'):
+            if np.isnan(ema9) or np.isnan(ema21):
+                a1_pass = True  # 数据缺失放行
+            elif direction == 'BUY':
+                a1_pass = ema9 > ema21
+            else:
+                a1_pass = ema9 < ema21
+
+        # A2: EMA50 最近 N 根 bar 单调性 (BUY 不允许连续下行, SELL 不允许连续上行)
+        a2_pass = True
+        if mode in ('a2', 'a1+a2'):
+            lookback = self._keltner_trend_filter_ema50_lookback
+            start = max(0, h1_idx - lookback + 1)
+            window = self._h1_ema50_arr[start:h1_idx + 1]
+            if len(window) < 2 or np.any(np.isnan(window)):
+                a2_pass = True  # 数据不足放行
+            else:
+                diffs = np.diff(window)  # 长度 = lookback - 1
+                if direction == 'BUY':
+                    # 不允许所有 diff < 0 (连续下行)
+                    a2_pass = not np.all(diffs < 0)
+                else:
+                    # 不允许所有 diff > 0 (连续上行)
+                    a2_pass = not np.all(diffs > 0)
+
+        # 联合判定
+        if mode == 'a1':
+            return a1_pass
+        if mode == 'a2':
+            return a2_pass
+        if mode == 'a1+a2':
+            return a1_pass and a2_pass
+        return True
+
     def _get_atr_percentile_at(self, h1_idx: Optional[int]) -> float:
         """O(1) replacement for _get_atr_percentile(h1_window)."""
         if h1_idx is None or h1_idx < 0 or h1_idx >= self._h1_n:
@@ -1013,19 +1101,55 @@ class BacktestEngine:
                     self.maxloss_cap_count_by_strategy[pos.strategy] = \
                         self.maxloss_cap_count_by_strategy.get(pos.strategy, 0) + 1
 
-            # 1b. Breakeven stop: move SL to entry when profit exceeds threshold
-            if not reason and self._breakeven_after_atr > 0 and pos.strategy == 'keltner':
-                atr_be = self._get_h1_atr_at(h1_idx)
-                if atr_be > 0:
-                    be_threshold = atr_be * self._breakeven_after_atr
-                    if pos.direction == 'BUY':
-                        if high - pos.entry_price >= be_threshold and pos.sl_price < pos.entry_price:
-                            pos.sl_price = pos.entry_price
-                            self.breakeven_triggered += 1
+            # 1b. Breakeven / Profit Lock-in (R250: multi-tier + buffer + per-strategy)
+            if not reason:
+                # 判断当前策略是否启用 BE
+                if self._breakeven_strategies is None:
+                    be_enabled = (pos.strategy == 'keltner')  # 兼容旧行为
+                elif self._breakeven_strategies == {'all'}:
+                    be_enabled = True
+                else:
+                    be_enabled = pos.strategy in self._breakeven_strategies
+
+                if be_enabled:
+                    # 构建档位列表 (按 threshold 升序排好)
+                    if self._breakeven_tiers:
+                        tiers = self._breakeven_tiers
+                    elif self._breakeven_after_atr > 0:
+                        tiers = [(self._breakeven_after_atr, self._breakeven_buffer_atr)]
                     else:
-                        if pos.entry_price - low >= be_threshold and pos.sl_price > pos.entry_price:
-                            pos.sl_price = pos.entry_price
-                            self.breakeven_triggered += 1
+                        tiers = []
+
+                    if tiers:
+                        atr_be = self._get_h1_atr_at(h1_idx)
+                        if atr_be > 0:
+                            # 从最高档往下检查, 取已触发的最高档
+                            for threshold_atr, buffer_atr in reversed(tiers):
+                                be_threshold = atr_be * threshold_atr
+                                buf_dollar = atr_be * buffer_atr
+                                triggered = False
+                                if pos.direction == 'BUY':
+                                    # BUY: 浮盈 >= 阈值 时, SL 上移到 entry + buf
+                                    if high - pos.entry_price >= be_threshold:
+                                        new_sl = pos.entry_price + buf_dollar
+                                        if new_sl > pos.sl_price:
+                                            pos.sl_price = new_sl
+                                            triggered = True
+                                else:
+                                    # SELL: 浮盈 >= 阈值 时, SL 下移到 entry - buf
+                                    if pos.entry_price - low >= be_threshold:
+                                        new_sl = pos.entry_price - buf_dollar
+                                        if pos.sl_price == 0 or new_sl < pos.sl_price:
+                                            pos.sl_price = new_sl
+                                            triggered = True
+                                if triggered:
+                                    self.breakeven_triggered += 1
+                                    self.breakeven_triggered_by_strategy[pos.strategy] = \
+                                        self.breakeven_triggered_by_strategy.get(pos.strategy, 0) + 1
+                                    tier_key = f"{threshold_atr}_{buffer_atr}"
+                                    self.breakeven_tier_triggered[tier_key] = \
+                                        self.breakeven_tier_triggered.get(tier_key, 0) + 1
+                                    break  # 只取最高已触发档, 不重复
 
             # 1c. Progressive SL tightening: reduce SL distance as bars_held increases
             if (not reason and self._prog_sl_start > 0 and self._prog_sl_steps > 0
@@ -1090,6 +1214,41 @@ class BacktestEngine:
                             if high >= pos.trailing_stop_price:
                                 reason = "Trailing"
                                 exit_price = pos.trailing_stop_price
+
+            # 2b. R250 DualThrust trailing stop (默认关闭, sweep 时启用)
+            if (not reason and pos.strategy == 'dual_thrust'
+                    and self._dual_thrust_trail_enabled):
+                act_atr = self._dual_thrust_trail_act
+                dist_atr = self._dual_thrust_trail_dist
+                atr = self._get_h1_atr_at(h1_idx)
+                if atr > 0:
+                    if pos.direction == 'BUY':
+                        float_profit = high - pos.entry_price
+                        pos.extreme_price = max(pos.extreme_price, high)
+                    else:
+                        float_profit = pos.entry_price - low
+                        pos.extreme_price = (min(pos.extreme_price, low)
+                                             if pos.extreme_price > 0 else low)
+                    if float_profit >= atr * act_atr:
+                        trail_distance = atr * dist_atr
+                        if pos.direction == 'BUY':
+                            new_trail = pos.extreme_price - trail_distance
+                            pos.trailing_stop_price = max(pos.trailing_stop_price, new_trail)
+                            if low <= pos.trailing_stop_price:
+                                reason = "Trailing"
+                                exit_price = pos.trailing_stop_price
+                                self.dual_thrust_trail_triggered += 1
+                        else:
+                            new_trail = pos.extreme_price + trail_distance
+                            if pos.trailing_stop_price <= 0:
+                                pos.trailing_stop_price = new_trail
+                            else:
+                                pos.trailing_stop_price = min(
+                                    pos.trailing_stop_price, new_trail)
+                            if high >= pos.trailing_stop_price:
+                                reason = "Trailing"
+                                exit_price = pos.trailing_stop_price
+                                self.dual_thrust_trail_triggered += 1
 
             # 3. Signal exit
             if not reason and pos.strategy == 'keltner':
@@ -1975,6 +2134,12 @@ class BacktestEngine:
             strategy = sig['strategy']
             direction = sig['signal']
             entry_price = entry_price_override if entry_price_override > 0 else sig['close']
+
+            # R250 Track A: Keltner BUY/SELL H1 趋势过滤
+            if strategy == 'keltner' and self._keltner_trend_filter_mode != 'off':
+                if not self._check_keltner_h1_trend(h1_idx, direction):
+                    self.keltner_trend_filtered_count += 1
+                    continue
 
             # Apply realistic entry slippage (worsens entry for trader)
             slip = self._calc_entry_slippage(direction)
