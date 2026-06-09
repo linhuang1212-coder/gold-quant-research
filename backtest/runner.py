@@ -832,6 +832,33 @@ REALISTIC_COST_KWARGS = {
     "slippage_sell": 0.17,
 }
 
+# R253: per-strategy entry slippage, re-calibrated from 243 live trades (2026-06).
+# The single global 0.67/0.17 was calibrated on a keltner-heavy sample and badly
+# under-models BREAKOUT entries (enter at range break = widest spread + momentum
+# continuation). Measured: keltner BUY 0.66/SELL 1.00 (147 trades); dual_thrust
+# BUY 1.68/SELL 1.89 (32 trades). The breakout figure is applied to all
+# breakout-class strategies (sess_bo/donchian/psar/chandelier) which lack large
+# own live samples — an explicit class assumption, not per-strategy measurement.
+SLIPPAGE_BY_STRATEGY = {
+    # mean-reversion / pullback entries (calmer)
+    "keltner":     (0.66, 1.00),
+    "m30_rsi14":   (0.66, 1.00),
+    "m15_rsi":     (0.66, 1.00),
+    # breakout entries (range break — high slip)
+    "dual_thrust": (1.70, 1.90),
+    "sess_bo":     (1.70, 1.90),
+    "donchian":    (1.70, 1.90),
+    "psar":        (1.70, 1.90),
+    "chandelier":  (1.70, 1.90),
+}
+
+# Strategy-aware realistic cost. USE THIS (not REALISTIC_COST_KWARGS) when
+# validating breakout strategies, so their true entry slippage is charged.
+REALISTIC_COST_BY_STRATEGY_KWARGS = {
+    **REALISTIC_COST_KWARGS,
+    "slippage_by_strategy": SLIPPAGE_BY_STRATEGY,
+}
+
 # Legacy L5.1 preset — kept for historical comparison only.
 # DO NOT use for new experiments; use LIVE_PARITY_KWARGS instead.
 L51_PARITY_KWARGS = {

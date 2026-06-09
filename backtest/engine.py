@@ -157,6 +157,11 @@ class BacktestEngine:
         slippage_buy: float = 0.67,         # mean BUY entry slippage from live data ($)
         slippage_sell: float = 0.17,         # mean SELL entry slippage from live data ($)
         slippage_seed: int = 42,             # RNG seed for empirical sampling
+        # Per-strategy entry slippage override (R253): breakout strategies slip
+        # 2.5-11x mean-reversion at entry. dict {strategy: (buy_slip, sell_slip)}.
+        # Takes precedence over the global model for listed strategies; others
+        # fall back to slippage_model/buy/sell. None = old global behavior.
+        slippage_by_strategy: Optional[dict] = None,
         # Macro regime (P4)
         macro_df: Optional[pd.DataFrame] = None,
         macro_regime_enabled: bool = False,
@@ -394,6 +399,8 @@ class BacktestEngine:
         self._slippage_buy = slippage_buy
         self._slippage_sell = slippage_sell
         self._slippage_rng = np.random.RandomState(slippage_seed)
+        # R253: per-strategy slippage override (breakout strategies slip more)
+        self._slippage_by_strategy = slippage_by_strategy or {}
         # Empirical distributions from live trading (sorted, for resampling)
         self._empirical_buy_slips = np.array([
             -3.43, -1.29, -1.17, -0.82, -0.59, -0.53, -0.28, -0.22,
@@ -2142,7 +2149,7 @@ class BacktestEngine:
                     continue
 
             # Apply realistic entry slippage (worsens entry for trader)
-            slip = self._calc_entry_slippage(direction)
+            slip = self._calc_entry_slippage(direction, strategy)
             if slip != 0.0:
                 if direction == 'BUY':
                     entry_price += slip
@@ -2270,12 +2277,21 @@ class BacktestEngine:
 
     # ── Entry slippage ─────────────────────────────────────────
 
-    def _calc_entry_slippage(self, direction: str) -> float:
+    def _calc_entry_slippage(self, direction: str, strategy: str = None) -> float:
         """Return entry slippage in price units (positive = worse for trader).
 
         Models calibrated from 91 real EA trades (2026-04 to 2026-05):
           BUY  mean +$0.67, SELL mean +$0.17 (direction-asymmetric).
+
+        R253: a per-strategy override (calibrated mean by strategy/class) takes
+        precedence — breakout entries (dual_thrust/sess_bo/donchian) slip far more
+        than mean-reversion (keltner), which the single global model under-models.
         """
+        # Per-strategy calibrated override wins (fixed at that strategy's mean).
+        if strategy and strategy in self._slippage_by_strategy:
+            sb, ss = self._slippage_by_strategy[strategy]
+            return sb if direction == 'BUY' else ss
+
         if self._slippage_model == "none":
             return 0.0
 
